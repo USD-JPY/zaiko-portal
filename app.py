@@ -46,13 +46,12 @@ PRINT_LIMITS = {
 }
 
 # Google ドライブから最新Excelを自動取得する関数
-@st.cache_data(ttl=300)  # 5分間キャッシュ（頻繁な再取得を防ぐ）
+@st.cache_data(ttl=300)  # 5分間キャッシュ
 def fetch_excel_from_gdrive(file_id):
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
     response = session.get(url, allow_redirects=True)
     
-    # 大容量ファイル警告のトークン処理
     for key, val in response.cookies.items():
         if key.startswith("download_warning"):
             url = f"{url}&confirm={val}"
@@ -60,7 +59,7 @@ def fetch_excel_from_gdrive(file_id):
             break
             
     if response.status_code == 200:
-        return io.BytesIO(response.content), None
+        return response.content, None
     return None, f"取得エラー（ステータスコード: {response.status_code}）"
 
 # 表示列の定義
@@ -91,7 +90,9 @@ def load_and_clean_data(file_source, sheet_name):
         limit_row = PRINT_LIMITS.get(sheet_name, 355)
         max_data_rows = limit_row - 2  # ヘッダー分を調整して印刷範囲内に制限
         
-        df = pd.read_excel(file_source, sheet_name=sheet_name, skiprows=1, nrows=max_data_rows)
+        # Bytesデータまたはファイルパスを読込
+        source = io.BytesIO(file_source) if isinstance(file_source, bytes) else file_source
+        df = pd.read_excel(source, sheet_name=sheet_name, skiprows=1, nrows=max_data_rows)
         drop_cols = [c for c in ['Unnamed: 0', '商品区分'] if c in df.columns]
         if drop_cols:
             df = df.drop(columns=drop_cols)
@@ -282,6 +283,7 @@ def render_sortable_table_component(df, height=720):
 st.subheader("📑 在庫管理表ビューア")
 
 # データソースの自動取得判定
+raw_bytes_data = None
 target_source = None
 data_info_text = ""
 
@@ -289,33 +291,46 @@ data_info_text = ""
 gdrive_id = st.secrets.get("GDRIVE_FILE_ID")
 if gdrive_id:
     with st.spinner("Google ドライブから最新データを取得中..."):
-        gdrive_bytes, g_err = fetch_excel_from_gdrive(gdrive_id)
-        if gdrive_bytes:
-            target_source = gdrive_bytes
+        raw_bytes_data, g_err = fetch_excel_from_gdrive(gdrive_id)
+        if raw_bytes_data:
+            target_source = raw_bytes_data
             data_info_text = "☁️ Google ドライブから自動取得中"
         else:
             st.warning(f"Google ドライブ連携エラー: {g_err}")
 
-# 2. 手動アップロード（予備・緊急用）
+# 2. 手動アップロード（予備）
 with st.expander("📂 手動で別ファイルをアップロードする場合（予備）"):
     uploaded_file = st.file_uploader("最新Excelをドラッグ＆ドロップ", type=["xlsx"])
     if uploaded_file:
-        target_source = uploaded_file
+        raw_bytes_data = uploaded_file.getvalue()
+        target_source = raw_bytes_data
         data_info_text = f"📎 アップロード中: `{uploaded_file.name}`"
 
-# 3. リポジトリ内の初期サンプル
+# 3. 初期サンプル
 if not target_source and os.path.exists("sample_data.xlsx"):
-    target_source = "sample_data.xlsx"
+    with open("sample_data.xlsx", "rb") as f:
+        raw_bytes_data = f.read()
+    target_source = raw_bytes_data
     data_info_text = "📁 サンプルデータを表示中"
 
-# 上部操作バー
-c_sheet, c_reload = st.columns([3, 1])
+# 上部バー（シート切替、再読込、ダウンロードボタン）
+c_sheet, c_btn1, c_btn2 = st.columns([2.5, 1, 1.2])
 with c_sheet:
     sheet_choice = st.radio("表示シート", ["商品別販売実績表", "商品別販売実績表_2minutes"], horizontal=True)
-with c_reload:
+with c_btn1:
     if st.button("🔄 最新データ再読込", key="reload_cloud"):
         st.cache_data.clear()
         st.rerun()
+with c_btn2:
+    if raw_bytes_data:
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        st.download_button(
+            label="📥 Excelダウンロード",
+            data=raw_bytes_data,
+            file_name=f"在庫管理表_{today_str}_軽量版.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_excel"
+        )
 
 if data_info_text:
     st.caption(data_info_text)
@@ -325,7 +340,8 @@ if target_source:
     if err:
         st.error(f"データの読み込みに失敗しました: {err}")
     elif df_data is not None:
-        col_s, col_k, col_o, col_r = st.columns([2.5, 1.2, 1, 1])
+        # 順番リセットボタンを削除し、検索とソートのみの3列構成に変更
+        col_s, col_k, col_o = st.columns([3, 1.5, 1.2])
         with col_s:
             s_query = st.text_input("🔍 絞り込み検索（商品名 / コード / 備考 / メーカー）")
         with col_k:
@@ -333,11 +349,6 @@ if target_source:
             chosen_sort = st.selectbox("並び替え項目", sort_options)
         with col_o:
             chosen_order = st.selectbox("順序", ["昇順 (小→大)", "降順 (大→小)"])
-        with col_r:
-            st.write("")
-            st.write("")
-            if st.button("🔄 順番リセット"):
-                st.rerun()
 
         filtered_df = df_data.copy()
         if s_query:
