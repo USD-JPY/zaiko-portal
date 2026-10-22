@@ -3,18 +3,19 @@ import sys
 import io
 import datetime
 import requests
+import openpyxl
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="在庫管理ポータル", layout="wide")
+st.set_page_config(page_title="社内ポータル", layout="wide")
 
 # ==========================================
-# 簡易パスワード認証（セキュリティ保護）
+# 簡易パスワード認証
 # ==========================================
 def check_password():
     def password_entered():
-        if st.session_state["password"] == "oft2026":  # ← 社内用パスワード
+        if st.session_state["password"] == "oft2026":
             st.session_state["password_correct"] = True
             del st.session_state["password"]
         else:
@@ -35,34 +36,32 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 本編アプリケーション
+# Google ドライブ取得共通関数
 # ==========================================
-st.title("📦 在庫管理ポータル (クラウド版)")
-
-# 印刷範囲の上限設定（商品別販売実績表: 355行、2minutes: 557行）
-PRINT_LIMITS = {
-    "商品別販売実績表": 355,
-    "商品別販売実績表_2minutes": 557
-}
-
-# Google ドライブから最新Excelを自動取得する関数
-@st.cache_data(ttl=300)  # 5分間キャッシュ
+@st.cache_data(ttl=300)
 def fetch_excel_from_gdrive(file_id):
+    if not file_id:
+        return None, "File IDが未設定です"
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
     response = session.get(url, allow_redirects=True)
-    
     for key, val in response.cookies.items():
         if key.startswith("download_warning"):
             url = f"{url}&confirm={val}"
             response = session.get(url, allow_redirects=True)
             break
-            
     if response.status_code == 200:
         return response.content, None
     return None, f"取得エラー（ステータスコード: {response.status_code}）"
 
-# 表示列の定義
+# ==========================================
+# タブ1用：在庫管理表 固有処理
+# ==========================================
+PRINT_LIMITS = {
+    "商品別販売実績表": 355,
+    "商品別販売実績表_2minutes": 557
+}
+
 def extract_target_columns(df):
     front_cols = [
         '商品コード', '商品名', '備考', '当月', '前月比', 'AVC',
@@ -71,7 +70,6 @@ def extract_target_columns(df):
     ]
     month_cols = [c for c in df.columns if (isinstance(c, str) and len(c) == 7 and '.' in c and c[:4].isdigit())]
     back_cols = ['12ヶ月計', 'メーカー']
-    
     ordered_cols = []
     for c in front_cols:
         if c in df.columns:
@@ -82,26 +80,20 @@ def extract_target_columns(df):
     for c in back_cols:
         if c in df.columns:
             ordered_cols.append(c)
-            
     return df[ordered_cols].copy()
 
-def load_and_clean_data(file_source, sheet_name):
+def load_and_clean_stock_data(raw_bytes, sheet_name):
     try:
         limit_row = PRINT_LIMITS.get(sheet_name, 355)
-        max_data_rows = limit_row - 2  # ヘッダー分を調整して印刷範囲内に制限
-        
-        # Bytesデータまたはファイルパスを読込
-        source = io.BytesIO(file_source) if isinstance(file_source, bytes) else file_source
-        df = pd.read_excel(source, sheet_name=sheet_name, skiprows=1, nrows=max_data_rows)
+        max_data_rows = limit_row - 2
+        df = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet_name, skiprows=1, nrows=max_data_rows)
         drop_cols = [c for c in ['Unnamed: 0', '商品区分'] if c in df.columns]
         if drop_cols:
             df = df.drop(columns=drop_cols)
-            
         if '商品コード' in df.columns:
             df = df.dropna(subset=['商品コード'])
             df = df[~df['商品コード'].astype(str).str.contains('<', na=False)]
             df['商品コード'] = df['商品コード'].astype(str).str.replace(r'\.0$', '', regex=True)
-            
         new_cols = []
         for c in df.columns:
             if isinstance(c, (datetime.datetime, pd.Timestamp)):
@@ -114,11 +106,9 @@ def load_and_clean_data(file_source, sheet_name):
             df['次回入荷'] = df['次回入荷'].fillna('').astype(str).str.replace(r'\.0$', '', regex=True)
             df['次回入荷'] = df['次回入荷'].replace(['nan', 'None', 'NaT'], '')
 
-        int_cols = ['総在庫数', '久代', '累計粗利', '評価単価', '当月', '前月比', 'AVC', '注文数量', '12ヶ月計']
-        for col in int_cols:
+        for col in ['総在庫数', '久代', '累計粗利', '評価単価', '当月', '前月比', 'AVC', '注文数量', '12ヶ月計']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-
         for col in ['月平均', '販売可能月', '粗利率']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -132,7 +122,6 @@ def safe_sort_dataframe(df, sort_col, is_asc):
         return df
     if pd.api.types.is_numeric_dtype(df[sort_col]):
         return df.sort_values(by=sort_col, ascending=is_asc, na_position='last')
-    
     def sort_key(series):
         return series.apply(lambda x: (0, float(x)) if str(x).replace('.', '', 1).isdigit() else (1, str(x)))
     try:
@@ -140,7 +129,6 @@ def safe_sort_dataframe(df, sort_col, is_asc):
     except Exception:
         return df.sort_values(by=sort_col, ascending=is_asc, key=lambda s: s.astype(str), na_position='last')
 
-# テーブル描画
 def render_sortable_table_component(df, height=720):
     cols = df.columns.tolist()
     html_content = f"""
@@ -184,7 +172,6 @@ def render_sortable_table_component(df, height=720):
             text_align = "left"
             formatted_val = ""
             is_na = pd.isna(val) or val is None or val == '' or str(val).strip() in ['nan', 'None', 'NaT']
-
             if not is_na:
                 if c == '販売可能月':
                     text_align = "right"
@@ -278,89 +265,175 @@ def render_sortable_table_component(df, height=720):
     components.html(html_content, height=height, scrolling=False)
 
 # ==========================================
-# 画面構成
+# タブ2・タブ3用：汎用Excelビューア処理
 # ==========================================
-st.subheader("📑 在庫管理表ビューア")
+def get_excel_sheets(raw_bytes):
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True)
+        return wb.sheetnames
+    except Exception:
+        return []
 
-# データソースの自動取得判定
-raw_bytes_data = None
-target_source = None
-data_info_text = ""
+def load_generic_sheet(raw_bytes, sheet_name):
+    try:
+        df = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet_name)
+        # 不要な空行・空列の除去
+        df = df.dropna(how='all').dropna(how='all', axis=1)
+        # 列名整形
+        df.columns = [str(c).replace('\n', ' ').strip() for c in df.columns]
+        return df, None
+    except Exception as e:
+        return None, str(e)
 
-# 1. Google ドライブ連携の確認
-gdrive_id = st.secrets.get("GDRIVE_FILE_ID")
-if gdrive_id:
-    with st.spinner("Google ドライブから最新データを取得中..."):
-        raw_bytes_data, g_err = fetch_excel_from_gdrive(gdrive_id)
-        if raw_bytes_data:
-            target_source = raw_bytes_data
-            data_info_text = "☁️ Google ドライブから自動取得中"
-        else:
-            st.warning(f"Google ドライブ連携エラー: {g_err}")
 
-# 2. 手動アップロード（予備）
-with st.expander("📂 手動で別ファイルをアップロードする場合（予備）"):
-    uploaded_file = st.file_uploader("最新Excelをドラッグ＆ドロップ", type=["xlsx"])
-    if uploaded_file:
-        raw_bytes_data = uploaded_file.getvalue()
-        target_source = raw_bytes_data
-        data_info_text = f"📎 アップロード中: `{uploaded_file.name}`"
+# ==========================================
+# メイン画面構成
+# ==========================================
+st.title("🏢 社内業務・資料ポータル (クラウド版)")
 
-# 3. 初期サンプル
-if not target_source and os.path.exists("sample_data.xlsx"):
-    with open("sample_data.xlsx", "rb") as f:
-        raw_bytes_data = f.read()
-    target_source = raw_bytes_data
-    data_info_text = "📁 サンプルデータを表示中"
+tab_stock, tab_meeting, tab_daily = st.tabs([
+    "📦 在庫管理表",
+    "📊 営業会議資料",
+    "🛒 各モールデイリー"
+])
 
-# 上部バー（シート切替、再読込、ダウンロードボタン）
-c_sheet, c_btn1, c_btn2 = st.columns([2.5, 1, 1.2])
-with c_sheet:
-    sheet_choice = st.radio("表示シート", ["商品別販売実績表", "商品別販売実績表_2minutes"], horizontal=True)
-with c_btn1:
-    if st.button("🔄 最新データ再読込", key="reload_cloud"):
-        st.cache_data.clear()
-        st.rerun()
-with c_btn2:
-    if raw_bytes_data:
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
-        st.download_button(
-            label="📥 Excelダウンロード",
-            data=raw_bytes_data,
-            file_name=f"在庫管理表_{today_str}_軽量版.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_excel"
-        )
+# ------------------------------------------------------------------
+# タブ 1：在庫管理表
+# ------------------------------------------------------------------
+with tab_stock:
+    st.subheader("📑 在庫管理表ビューア")
+    gdrive_stock_id = st.secrets.get("GDRIVE_FILE_ID")
+    stock_bytes, s_err = fetch_excel_from_gdrive(gdrive_stock_id)
 
-if data_info_text:
-    st.caption(data_info_text)
+    c1, c2, c3 = st.columns([2.5, 1, 1.2])
+    with c1:
+        sheet_choice = st.radio("表示シート", ["商品別販売実績表", "商品別販売実績表_2minutes"], horizontal=True, key="stock_sheet")
+    with c2:
+        if st.button("🔄 最新データ再読込", key="stock_reload"):
+            st.cache_data.clear()
+            st.rerun()
+    with c3:
+        if stock_bytes:
+            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            st.download_button(
+                label="📥 Excelダウンロード",
+                data=stock_bytes,
+                file_name=f"在庫管理表_{today_str}_軽量版.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_stock"
+            )
 
-if target_source:
-    df_data, err = load_and_clean_data(target_source, sheet_choice)
-    if err:
-        st.error(f"データの読み込みに失敗しました: {err}")
-    elif df_data is not None:
-        # 順番リセットボタンを削除し、検索とソートのみの3列構成に変更
-        col_s, col_k, col_o = st.columns([3, 1.5, 1.2])
-        with col_s:
-            s_query = st.text_input("🔍 絞り込み検索（商品名 / コード / 備考 / メーカー）")
-        with col_k:
-            sort_options = ["(元の並び順)"] + [c for c in df_data.columns if c in ['商品コード', '販売可能月', '総在庫数', '当月', '前月比', '月平均', '粗利率', '商品名']]
-            chosen_sort = st.selectbox("並び替え項目", sort_options)
-        with col_o:
-            chosen_order = st.selectbox("順序", ["昇順 (小→大)", "降順 (大→小)"])
+    if stock_bytes:
+        st.caption("☁️ Google ドライブから自動取得中")
+        df_data, err = load_and_clean_stock_data(stock_bytes, sheet_choice)
+        if err:
+            st.error(f"データ読込エラー: {err}")
+        elif df_data is not None:
+            col_s, col_k, col_o = st.columns([3, 1.5, 1.2])
+            with col_s:
+                s_query = st.text_input("🔍 絞り込み検索（商品名 / コード / 備考 / メーカー）", key="stock_search")
+            with col_k:
+                sort_options = ["(元の並び順)"] + [c for c in df_data.columns if c in ['商品コード', '販売可能月', '総在庫数', '当月', '前月比', '月平均', '粗利率', '商品名']]
+                chosen_sort = st.selectbox("並び替え項目", sort_options, key="stock_sort_col")
+            with col_o:
+                chosen_order = st.selectbox("順序", ["昇順 (小→大)", "降順 (大→小)"], key="stock_sort_ord")
 
-        filtered_df = df_data.copy()
-        if s_query:
-            sq = s_query.strip().lower()
-            mask = filtered_df.astype(str).apply(lambda row: row.str.lower().str.contains(sq).any(), axis=1)
-            filtered_df = filtered_df[mask]
+            filtered_df = df_data.copy()
+            if s_query:
+                sq = s_query.strip().lower()
+                mask = filtered_df.astype(str).apply(lambda row: row.str.lower().str.contains(sq).any(), axis=1)
+                filtered_df = filtered_df[mask]
 
-        if chosen_sort != "(元の並び順)":
-            is_asc = (chosen_order == "昇順 (小→大)")
-            filtered_df = safe_sort_dataframe(filtered_df, chosen_sort, is_asc)
+            if chosen_sort != "(元の並び順)":
+                is_asc = (chosen_order == "昇順 (小→大)")
+                filtered_df = safe_sort_dataframe(filtered_df, chosen_sort, is_asc)
 
-        st.caption(f"表示件数: **{len(filtered_df):,}** 行 / 全 **{len(df_data):,}** 行（印刷範囲内）  ※ヘッダー項目クリックでも並び替わります。")
-        render_sortable_table_component(filtered_df, height=720)
-else:
-    st.info("データが設定されていません。SecretsでGDRIVE_FILE_IDを指定するか、ファイルをアップロードしてください。")
+            st.caption(f"表示件数: **{len(filtered_df):,}** 行 / 全 **{len(df_data):,}** 行（印刷範囲内）  ※ヘッダー項目クリックでも並び替わります。")
+            render_sortable_table_component(filtered_df, height=720)
+    else:
+        st.warning(f"Google ドライブ連携エラー: {s_err}")
+
+# ------------------------------------------------------------------
+# タブ 2：営業会議資料
+# ------------------------------------------------------------------
+with tab_meeting:
+    st.subheader("📊 営業会議資料ビューア")
+    gdrive_meeting_id = st.secrets.get("GDRIVE_MEETING_FILE_ID")
+    meeting_bytes, m_err = fetch_excel_from_gdrive(gdrive_meeting_id)
+
+    if meeting_bytes:
+        sheet_list = get_excel_sheets(meeting_bytes)
+        c_m1, c_m2, c_m3 = st.columns([3, 1, 1.2])
+        with c_m1:
+            selected_sheet = st.selectbox("表示するシートを選択", sheet_list, key="meet_sheet_sel")
+        with c_m2:
+            if st.button("🔄 再読込", key="meet_reload"):
+                st.cache_data.clear()
+                st.rerun()
+        with c_m3:
+            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            st.download_button(
+                label="📥 Excelダウンロード",
+                data=meeting_bytes,
+                file_name=f"営業会議用資料_{today_str}_軽量版.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_meet"
+            )
+
+        st.caption("☁️ Google ドライブから自動取得中")
+
+        df_meet, err = load_generic_sheet(meeting_bytes, selected_sheet)
+        if err:
+            st.error(f"シートの読込に失敗しました: {err}")
+        elif df_meet is not None:
+            q_meet = st.text_input("🔍 シート内テキスト絞り込み検索", key="meet_search")
+            if q_meet:
+                qm = q_meet.strip().lower()
+                df_meet = df_meet[df_meet.astype(str).apply(lambda row: row.str.lower().str.contains(qm).any(), axis=1)]
+            st.dataframe(df_meet, use_container_width=True, height=650)
+    else:
+        st.warning(f"営業会議資料の取得エラー: {m_err}")
+
+# ------------------------------------------------------------------
+# タブ 3：各モール販売状況デイリー
+# ------------------------------------------------------------------
+with tab_daily:
+    st.subheader("🛒 各モール販売状況デイリービューア")
+    gdrive_daily_id = st.secrets.get("GDRIVE_DAILY_FILE_ID")
+    daily_bytes, d_err = fetch_excel_from_gdrive(gdrive_daily_id)
+
+    if daily_bytes:
+        daily_sheets = get_excel_sheets(daily_bytes)
+        # デフォルトで「楽天」を選択、なければ先頭
+        default_idx = daily_sheets.index("楽天") if "楽天" in daily_sheets else 0
+
+        c_d1, c_d2, c_d3 = st.columns([3, 1, 1.2])
+        with c_d1:
+            selected_daily_sheet = st.selectbox("表示するモール・シートを選択", daily_sheets, index=default_idx, key="daily_sheet_sel")
+        with c_d2:
+            if st.button("🔄 再読込", key="daily_reload"):
+                st.cache_data.clear()
+                st.rerun()
+        with c_d3:
+            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            st.download_button(
+                label="📥 Excelダウンロード",
+                data=daily_bytes,
+                file_name=f"各モール販売状況デイリー_{today_str}_軽量版.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_daily"
+            )
+
+        st.caption("☁️ Google ドライブから自動取得中")
+
+        df_daily, err = load_generic_sheet(daily_bytes, selected_daily_sheet)
+        if err:
+            st.error(f"シートの読込に失敗しました: {err}")
+        elif df_daily is not None:
+            q_daily = st.text_input("🔍 モール内データ絞り込み検索", key="daily_search")
+            if q_daily:
+                qd = q_daily.strip().lower()
+                df_daily = df_daily[df_daily.astype(str).apply(lambda row: row.str.lower().str.contains(qd).any(), axis=1)]
+            st.dataframe(df_daily, use_container_width=True, height=650)
+    else:
+        st.warning(f"各モールデイリー資料の取得エラー: {d_err}")
