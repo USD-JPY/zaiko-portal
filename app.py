@@ -1,7 +1,9 @@
+import os
+import sys
+import datetime
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-import pandas as pd
-import datetime
 
 st.set_page_config(page_title="在庫管理ポータル", layout="wide")
 
@@ -10,7 +12,7 @@ st.set_page_config(page_title="在庫管理ポータル", layout="wide")
 # ==========================================
 def check_password():
     def password_entered():
-        if st.session_state["password"] == "oft2026":  # ← 社内用パスワードを設定
+        if st.session_state["password"] == "oft2026":  # ← 社内用パスワード
             st.session_state["password_correct"] = True
             del st.session_state["password"]
         else:
@@ -34,6 +36,12 @@ if not check_password():
 # 本編アプリケーション
 # ==========================================
 st.title("📦 在庫管理ポータル (クラウド版)")
+
+# 印刷範囲の上限設定（商品別販売実績表: 355行、2minutes: 557行）
+PRINT_LIMITS = {
+    "商品別販売実績表": 355,
+    "商品別販売実績表_2minutes": 557
+}
 
 # 表示列の定義
 def extract_target_columns(df):
@@ -60,7 +68,10 @@ def extract_target_columns(df):
 
 def load_and_clean_data(file_source, sheet_name):
     try:
-        df = pd.read_excel(file_source, sheet_name=sheet_name, skiprows=1)
+        limit_row = PRINT_LIMITS.get(sheet_name, 355)
+        max_data_rows = limit_row - 2  # ヘッダー分を調整して印刷範囲内に制限
+        
+        df = pd.read_excel(file_source, sheet_name=sheet_name, skiprows=1, nrows=max_data_rows)
         drop_cols = [c for c in ['Unnamed: 0', '商品区分'] if c in df.columns]
         if drop_cols:
             df = df.drop(columns=drop_cols)
@@ -253,12 +264,13 @@ st.subheader("📑 在庫管理表ビューア")
 # クラウド用ファイルアップローダー
 uploaded_file = st.file_uploader("📂 最新の軽量版Excelファイルをここにドラッグ＆ドロップ", type=["xlsx"])
 
-# リポジトリ内の初期サンプルファイル（ある場合）
 target_source = uploaded_file if uploaded_file else "sample_data.xlsx"
 
 sheet_choice = st.radio("表示シート", ["商品別販売実績表", "商品別販売実績表_2minutes"], horizontal=True)
 
-if uploaded_file or os.path.exists("sample_data.xlsx"):
+has_sample = os.path.exists("sample_data.xlsx")
+
+if uploaded_file or has_sample:
     df_data, err = load_and_clean_data(target_source, sheet_choice)
     if err:
         st.error(f"データの読み込みに失敗しました: {err}")
@@ -287,7 +299,7 @@ if uploaded_file or os.path.exists("sample_data.xlsx"):
             is_asc = (chosen_order == "昇順 (小→大)")
             filtered_df = safe_sort_dataframe(filtered_df, chosen_sort, is_asc)
 
-        st.caption(f"表示件数: **{len(filtered_df):,}** 行 / 全 **{len(df_data):,}** 行  ※ヘッダー項目クリックでも並び替わります。")
+        st.caption(f"表示件数: **{len(filtered_df):,}** 行 / 全 **{len(df_data):,}** 行（印刷範囲内）  ※ヘッダー項目クリックでも並び替わります。")
         render_sortable_table_component(filtered_df, height=720)
 else:
     st.info("👆 上の枠に最新の軽量版Excel（`在庫管理表（xxxx）_軽量版.xlsx`）をアップロードしてください。")
