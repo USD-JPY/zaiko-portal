@@ -4,6 +4,7 @@ import io
 import datetime
 import requests
 import openpyxl
+from openpyxl.utils.cell import range_boundaries, get_column_letter
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -265,7 +266,7 @@ def render_sortable_table_component(df, height=720):
     components.html(html_content, height=height, scrolling=False)
 
 # ==========================================
-# タブ2・タブ3用：汎用Excelビューア処理
+# タブ2・タブ3用：Excel完全再現HTMLレンダラー
 # ==========================================
 def get_excel_sheets(raw_bytes):
     try:
@@ -274,17 +275,124 @@ def get_excel_sheets(raw_bytes):
     except Exception:
         return []
 
-def load_generic_sheet(raw_bytes, sheet_name):
-    try:
-        df = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet_name)
-        # 不要な空行・空列の除去
-        df = df.dropna(how='all').dropna(how='all', axis=1)
-        # 列名整形
-        df.columns = [str(c).replace('\n', ' ').strip() for c in df.columns]
-        return df, None
-    except Exception as e:
-        return None, str(e)
+def format_excel_cell_value(val, num_format):
+    if val is None or val == "":
+        return ""
+    if isinstance(val, (datetime.datetime, datetime.date)):
+        return val.strftime("%Y/%m/%d")
+    if isinstance(val, (int, float)):
+        fmt = str(num_format).lower()
+        if "%" in fmt or "0.0%" in fmt:
+            return f"{val * 100:.1f}%" if abs(val) < 10 else f"{val:.1f}%"
+        if "#,##" in fmt or "¥" in fmt or "currency" in fmt:
+            return f"{val:,.0f}" if float(val).is_integer() else f"{val:,.2f}"
+        if abs(val) >= 1000 and float(val).is_integer():
+            return f"{int(val):,}"
+    return str(val)
 
+def render_excel_sheet_as_html(raw_bytes, sheet_name, max_rows=60, max_cols=30, height=720):
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+        if sheet_name not in wb.sheetnames:
+            return f"<p style='color:red;'>シート『{sheet_name}』が見つかりません</p>"
+        ws = wb[sheet_name]
+
+        # 結合セルのマッピング
+        merged_cells = {}
+        skip_cells = set()
+        for m_range in ws.merged_cells.ranges:
+            min_col, min_row, max_col, max_row = m_range.bounds
+            rowspan = max_row - min_row + 1
+            colspan = max_col - min_col + 1
+            merged_cells[(min_row, min_col)] = (rowspan, colspan)
+            for r in range(min_row, max_row + 1):
+                for c in range(min_col, max_col + 1):
+                    if (r, c) != (min_row, min_col):
+                        skip_cells.add((r, c))
+
+        actual_max_row = min(ws.max_row, max_rows)
+        actual_max_col = min(ws.max_column, max_cols)
+
+        # 列幅の取得
+        col_widths = {}
+        for c in range(1, actual_max_col + 1):
+            c_letter = get_column_letter(c)
+            dim = ws.column_dimensions.get(c_letter)
+            w = dim.width if dim and dim.width else 10
+            col_widths[c] = int(max(w * 8.5, 45))
+
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <style>
+            body {{ margin: 0; padding: 0; font-family: "Meiryo", "Yu Gothic", sans-serif; background-color: #ffffff; }}
+            .sheet-container {{ width: 100%; height: {height - 20}px; overflow: auto; border: 1px solid #7f7f7f; }}
+            table.sheet-table {{ border-collapse: collapse; font-size: 11px; color: #000000; table-layout: fixed; }}
+            table.sheet-table td {{ border: 1px solid #d4d4d4; padding: 2px 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+            .bold {{ font-weight: bold; }}
+            .center {{ text-align: center; }}
+            .right {{ text-align: right; }}
+            .left {{ text-align: left; }}
+        </style>
+        </head>
+        <body>
+        <div class="sheet-container">
+            <table class="sheet-table">
+                <colgroup>
+        """
+        for c in range(1, actual_max_col + 1):
+            html += f'<col style="width: {col_widths.get(c, 70)}px;">'
+        html += "</colgroup><tbody>"
+
+        for r in range(1, actual_max_row + 1):
+            html += "<tr>"
+            for c in range(1, actual_max_col + 1):
+                if (r, c) in skip_cells:
+                    continue
+
+                cell = ws.cell(row=r, column=c)
+                val_formatted = format_excel_cell_value(cell.value, cell.number_format)
+
+                # アライメント判定
+                align_cls = "left"
+                if isinstance(cell.value, (int, float)):
+                    align_cls = "right"
+                elif isinstance(cell.value, (datetime.datetime, datetime.date)) or cell.alignment.horizontal == 'center':
+                    align_cls = "center"
+
+                styles = [f"text-align: {align_cls};"]
+                if cell.font and cell.font.bold:
+                    styles.append("font-weight: bold;")
+                if cell.font and cell.font.size and cell.font.size >= 14:
+                    styles.append(f"font-size: {int(cell.font.size)}px;")
+
+                # 背景色
+                if cell.fill and cell.fill.start_color and cell.fill.start_color.rgb:
+                    rgb = str(cell.fill.start_color.rgb)
+                    if len(rgb) == 8 and rgb != "00000000":
+                        styles.append(f"background-color: #{rgb[2:]};")
+                    elif len(rgb) == 6:
+                        styles.append(f"background-color: #{rgb};")
+
+                attrs = []
+                if (r, c) in merged_cells:
+                    rowspan, colspan = merged_cells[(r, c)]
+                    if rowspan > 1:
+                        attrs.append(f'rowspan="{rowspan}"')
+                    if colspan > 1:
+                        attrs.append(f'colspan="{colspan}"')
+
+                style_str = f' style="{" ".join(styles)}"' if styles else ''
+                attr_str = f' {" ".join(attrs)}' if attrs else ''
+                html += f'<td{attr_str}{style_str}>{val_formatted}</td>'
+            html += "</tr>"
+
+        html += "</tbody></table></div></body></html>"
+        return html
+    except Exception as e:
+        return f"<p style='color:red;'>描画エラー: {e}</p>"
 
 # ==========================================
 # メイン画面構成
@@ -363,9 +471,16 @@ with tab_meeting:
 
     if meeting_bytes:
         sheet_list = get_excel_sheets(meeting_bytes)
+        # デフォルトで当月（例: 2026.10）シート、なければ先頭
+        default_m_idx = 0
+        for idx, s in enumerate(sheet_list):
+            if "." in s and s[:4].isdigit():
+                default_m_idx = idx
+                break
+
         c_m1, c_m2, c_m3 = st.columns([3, 1, 1.2])
         with c_m1:
-            selected_sheet = st.selectbox("表示するシートを選択", sheet_list, key="meet_sheet_sel")
+            selected_sheet = st.selectbox("表示するシートを選択", sheet_list, index=default_m_idx, key="meet_sheet_sel")
         with c_m2:
             if st.button("🔄 再読込", key="meet_reload"):
                 st.cache_data.clear()
@@ -380,17 +495,9 @@ with tab_meeting:
                 key="dl_meet"
             )
 
-        st.caption("☁️ Google ドライブから自動取得中")
-
-        df_meet, err = load_generic_sheet(meeting_bytes, selected_sheet)
-        if err:
-            st.error(f"シートの読込に失敗しました: {err}")
-        elif df_meet is not None:
-            q_meet = st.text_input("🔍 シート内テキスト絞り込み検索", key="meet_search")
-            if q_meet:
-                qm = q_meet.strip().lower()
-                df_meet = df_meet[df_meet.astype(str).apply(lambda row: row.str.lower().str.contains(qm).any(), axis=1)]
-            st.dataframe(df_meet, use_container_width=True, height=650)
+        st.caption("☁️ Google ドライブから自動取得中（レイアウト・結合セル・書式を完全再現）")
+        html_sheet = render_excel_sheet_as_html(meeting_bytes, selected_sheet, max_rows=70, max_cols=30, height=720)
+        components.html(html_sheet, height=720, scrolling=False)
     else:
         st.warning(f"営業会議資料の取得エラー: {m_err}")
 
@@ -404,7 +511,6 @@ with tab_daily:
 
     if daily_bytes:
         daily_sheets = get_excel_sheets(daily_bytes)
-        # デフォルトで「楽天」を選択、なければ先頭
         default_idx = daily_sheets.index("楽天") if "楽天" in daily_sheets else 0
 
         c_d1, c_d2, c_d3 = st.columns([3, 1, 1.2])
@@ -424,16 +530,8 @@ with tab_daily:
                 key="dl_daily"
             )
 
-        st.caption("☁️ Google ドライブから自動取得中")
-
-        df_daily, err = load_generic_sheet(daily_bytes, selected_daily_sheet)
-        if err:
-            st.error(f"シートの読込に失敗しました: {err}")
-        elif df_daily is not None:
-            q_daily = st.text_input("🔍 モール内データ絞り込み検索", key="daily_search")
-            if q_daily:
-                qd = q_daily.strip().lower()
-                df_daily = df_daily[df_daily.astype(str).apply(lambda row: row.str.lower().str.contains(qd).any(), axis=1)]
-            st.dataframe(df_daily, use_container_width=True, height=650)
+        st.caption("☁️ Google ドライブから自動取得中（レイアウト・結合セル・書式を完全再現）")
+        html_daily = render_excel_sheet_as_html(daily_bytes, selected_daily_sheet, max_rows=50, max_cols=35, height=720)
+        components.html(html_daily, height=720, scrolling=False)
     else:
         st.warning(f"各モールデイリー資料の取得エラー: {d_err}")
