@@ -4,7 +4,6 @@ import io
 import datetime
 import requests
 import openpyxl
-from openpyxl.utils.cell import get_column_letter
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -265,165 +264,12 @@ def render_sortable_table_component(df, height=720):
     """
     components.html(html_content, height=height, scrolling=False)
 
-# ==========================================
-# タブ2・タブ3用：Excel帳票高度HTMLレンダラー
-# ==========================================
 def get_excel_sheets(raw_bytes):
     try:
         wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True)
         return wb.sheetnames
     except Exception:
         return []
-
-def format_excel_cell_value(val, num_format):
-    if val is None or val == "":
-        return ""
-    
-    fmt = str(num_format).lower()
-
-    # 1. 曜日書式（aaa）の変換（シリアル値または日付から「月〜日」を算出）
-    if "aaa" in fmt:
-        try:
-            if isinstance(val, (int, float)):
-                base_date = datetime.date(1899, 12, 30)
-                d = base_date + datetime.timedelta(days=int(val))
-                weekdays = ["月", "火", "水", "木", "金", "土", "日"]
-                return weekdays[d.weekday()]
-            elif isinstance(val, (datetime.datetime, datetime.date)):
-                weekdays = ["月", "火", "水", "木", "金", "土", "日"]
-                return weekdays[val.weekday()]
-        except Exception:
-            pass
-
-    # 2. 日付型
-    if isinstance(val, (datetime.datetime, datetime.date)):
-        return val.strftime("%Y/%m/%d")
-
-    # 3. 数値型
-    if isinstance(val, (int, float)):
-        # パーセント表示（%を含むか、小数点以下の微小値で比率の列）
-        if "%" in fmt or "0.0%" in fmt:
-            return f"{val * 100:.1f}%" if abs(val) < 15 else f"{val:.1f}%"
-        # 金額・カンマ区切り
-        if "#,##" in fmt or "¥" in fmt or "currency" in fmt:
-            return f"{val:,.0f}" if float(val).is_integer() else f"{val:,.2f}"
-        if abs(val) >= 1000 and float(val).is_integer():
-            return f"{int(val):,}"
-        # 小数点2桁前後の比率や転換率で%書式が漏れている場合
-        if 0 < abs(val) < 1 and ("rate" in fmt or "0.0" in fmt):
-            return f"{val * 100:.1f}%"
-        if isinstance(val, float):
-            return f"{val:.2f}".rstrip('0').rstrip('.')
-
-    return str(val)
-
-def render_excel_sheet_as_html(raw_bytes, sheet_name, max_rows=65, max_cols=30, height=720):
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
-        if sheet_name not in wb.sheetnames:
-            return f"<p style='color:red;'>シート『{sheet_name}』が見つかりません</p>"
-        ws = wb[sheet_name]
-
-        # 結合セルのマッピング
-        merged_cells = {}
-        skip_cells = set()
-        for m_range in ws.merged_cells.ranges:
-            min_col, min_row, max_col, max_row = m_range.bounds
-            rowspan = max_row - min_row + 1
-            colspan = max_col - min_col + 1
-            merged_cells[(min_row, min_col)] = (rowspan, colspan)
-            for r in range(min_row, max_row + 1):
-                for c in range(min_col, max_col + 1):
-                    if (r, c) != (min_row, min_col):
-                        skip_cells.add((r, c))
-
-        actual_max_row = min(ws.max_row, max_rows)
-        actual_max_col = min(ws.max_column, max_cols)
-
-        # 列幅の最適化
-        col_widths = {}
-        for c in range(1, actual_max_col + 1):
-            c_letter = get_column_letter(c)
-            dim = ws.column_dimensions.get(c_letter)
-            w = dim.width if dim and dim.width else None
-            # 曜日列（B, C）は細め、それ以外は標準〜広め
-            if c in [2, 3]:
-                col_widths[c] = 40
-            elif w:
-                col_widths[c] = int(max(w * 8.2, 50))
-            else:
-                col_widths[c] = 75
-
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta charset="utf-8">
-        <style>
-            body {{ margin: 0; padding: 0; font-family: "Meiryo", "Yu Gothic", sans-serif; background-color: #ffffff; }}
-            .sheet-container {{ width: 100%; height: {height - 20}px; overflow: auto; border: 1px solid #7f7f7f; }}
-            table.sheet-table {{ border-collapse: collapse; font-size: 11px; color: #000000; table-layout: fixed; }}
-            table.sheet-table td {{ border: 1px solid #c0c0c0; padding: 3px 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-            .row-header td {{ background-color: #f2f2f2; font-weight: bold; text-align: center; }}
-        </style>
-        </head>
-        <body>
-        <div class="sheet-container">
-            <table class="sheet-table">
-                <colgroup>
-        """
-        for c in range(1, actual_max_col + 1):
-            html += f'<col style="width: {col_widths.get(c, 75)}px;">'
-        html += "</colgroup><tbody>"
-
-        for r in range(1, actual_max_row + 1):
-            row_tr_class = ' class="row-header"' if r in [4, 5] else ''
-            html += f"<tr{row_tr_class}>"
-            for c in range(1, actual_max_col + 1):
-                if (r, c) in skip_cells:
-                    continue
-
-                cell = ws.cell(row=r, column=c)
-                val_formatted = format_excel_cell_value(cell.value, cell.number_format)
-
-                # 配置判定
-                align = "left"
-                if c in [1, 2, 3] or "aaa" in str(cell.number_format).lower() or isinstance(cell.value, (datetime.datetime, datetime.date)):
-                    align = "center"
-                elif isinstance(cell.value, (int, float)):
-                    align = "right"
-
-                styles = [f"text-align: {align};"]
-                if cell.font and cell.font.bold:
-                    styles.append("font-weight: bold;")
-                if cell.font and cell.font.size and cell.font.size >= 12:
-                    styles.append(f"font-size: {int(cell.font.size)}px;")
-
-                # 背景色
-                if cell.fill and cell.fill.start_color and cell.fill.start_color.rgb:
-                    rgb = str(cell.fill.start_color.rgb)
-                    if len(rgb) == 8 and rgb != "00000000":
-                        styles.append(f"background-color: #{rgb[2:]};")
-                    elif len(rgb) == 6:
-                        styles.append(f"background-color: #{rgb};")
-
-                attrs = []
-                if (r, c) in merged_cells:
-                    rowspan, colspan = merged_cells[(r, c)]
-                    if rowspan > 1:
-                        attrs.append(f'rowspan="{rowspan}"')
-                    if colspan > 1:
-                        attrs.append(f'colspan="{colspan}"')
-
-                style_str = f' style="{" ".join(styles)}"' if styles else ''
-                attr_str = f' {" ".join(attrs)}' if attrs else ''
-                html += f'<td{attr_str}{style_str}>{val_formatted}</td>'
-            html += "</tr>"
-
-        html += "</tbody></table></div></body></html>"
-        return html
-    except Exception as e:
-        return f"<p style='color:red;'>描画エラー: {e}</p>"
 
 # ==========================================
 # メイン画面構成
@@ -496,38 +342,37 @@ with tab_stock:
 # タブ 2：営業会議資料
 # ------------------------------------------------------------------
 with tab_meeting:
-    st.subheader("📊 営業会議資料ビューア")
+    st.subheader("📊 営業会議資料")
+    st.caption("Google ドライブから同期された最新の営業会議用資料（目標設定・実績表・各種ランキング）です。")
+    st.write("")
+
     gdrive_meeting_id = st.secrets.get("GDRIVE_MEETING_FILE_ID")
     meeting_bytes, m_err = fetch_excel_from_gdrive(gdrive_meeting_id)
 
     if meeting_bytes:
         sheet_list = get_excel_sheets(meeting_bytes)
-        default_m_idx = 0
-        for idx, s in enumerate(sheet_list):
-            if "." in s and s[:4].isdigit():
-                default_m_idx = idx
-                break
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
 
-        c_m1, c_m2, c_m3 = st.columns([3, 1, 1.2])
-        with c_m1:
-            selected_sheet = st.selectbox("表示するシートを選択", sheet_list, index=default_m_idx, key="meet_sheet_sel")
-        with c_m2:
-            if st.button("🔄 再読込", key="meet_reload"):
-                st.cache_data.clear()
-                st.rerun()
-        with c_m3:
-            today_str = datetime.datetime.now().strftime("%Y%m%d")
-            st.download_button(
-                label="📥 Excelダウンロード",
-                data=meeting_bytes,
-                file_name=f"営業会議用資料_{today_str}_軽量版.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_meet"
-            )
-
-        st.caption("☁️ Google ドライブから自動取得中（レイアウト・結合セル・書式を完全再現）")
-        html_sheet = render_excel_sheet_as_html(meeting_bytes, selected_sheet, max_rows=65, max_cols=25, height=720)
-        components.html(html_sheet, height=720, scrolling=False)
+        with st.container(border=True):
+            col_m_info, col_m_btn = st.columns([3, 1.2])
+            with col_m_info:
+                st.markdown("### 📄 営業会議用資料 (目標設定)_最新版")
+                st.write(f"**収録シート数**: {len(sheet_list)} シート")
+                st.write(f"**含まれるシート**: `{'` / `'.join(sheet_list[:6])}` ほか")
+                st.caption("※グラフや集計フォーマットをそのまま維持するため、Excelファイルにて閲覧・編集してください。")
+            with col_m_btn:
+                st.write("")
+                st.download_button(
+                    label="📥 最新Excelをダウンロード",
+                    data=meeting_bytes,
+                    file_name=f"営業会議用資料_{today_str}_軽量版.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_meet_card",
+                    use_container_width=True
+                )
+                if st.button("🔄 最新データ再読込", key="meet_reload_btn", use_container_width=True):
+                    st.cache_data.clear()
+                    st.rerun()
     else:
         st.warning(f"営業会議資料の取得エラー: {m_err}")
 
@@ -535,33 +380,36 @@ with tab_meeting:
 # タブ 3：各モール販売状況デイリー
 # ------------------------------------------------------------------
 with tab_daily:
-    st.subheader("🛒 各モール販売状況デイリービューア")
+    st.subheader("🛒 各モール販売状況デイリー")
+    st.caption("Google ドライブから同期された最新の各モールデイリー販売状況データです。")
+    st.write("")
+
     gdrive_daily_id = st.secrets.get("GDRIVE_DAILY_FILE_ID")
     daily_bytes, d_err = fetch_excel_from_gdrive(gdrive_daily_id)
 
     if daily_bytes:
         daily_sheets = get_excel_sheets(daily_bytes)
-        default_idx = daily_sheets.index("楽天") if "楽天" in daily_sheets else 0
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
 
-        c_d1, c_d2, c_d3 = st.columns([3, 1, 1.2])
-        with c_d1:
-            selected_daily_sheet = st.selectbox("表示するモール・シートを選択", daily_sheets, index=default_idx, key="daily_sheet_sel")
-        with c_d2:
-            if st.button("🔄 再読込", key="daily_reload"):
-                st.cache_data.clear()
-                st.rerun()
-        with c_d3:
-            today_str = datetime.datetime.now().strftime("%Y%m%d")
-            st.download_button(
-                label="📥 Excelダウンロード",
-                data=daily_bytes,
-                file_name=f"各モール販売状況デイリー_{today_str}_軽量版.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_daily"
-            )
-
-        st.caption("☁️ Google ドライブから自動取得中（レイアウト・結合セル・書式を完全再現）")
-        html_daily = render_excel_sheet_as_html(daily_bytes, selected_daily_sheet, max_rows=40, max_cols=30, height=720)
-        components.html(html_daily, height=720, scrolling=False)
+        with st.container(border=True):
+            col_d_info, col_d_btn = st.columns([3, 1.2])
+            with col_d_info:
+                st.markdown("### 📄 各モール販売状況デイリー_最新版")
+                st.write(f"**収録モール・シート数**: {len(daily_sheets)} 枚")
+                st.write(f"**含まれるシート**: `{'` / `'.join(daily_sheets[:6])}` ほか")
+                st.caption("※グラフや条件付き書式をそのまま維持するため、Excelファイルにて閲覧・編集してください。")
+            with col_d_btn:
+                st.write("")
+                st.download_button(
+                    label="📥 最新Excelをダウンロード",
+                    data=daily_bytes,
+                    file_name=f"各モール販売状況デイリー_{today_str}_軽量版.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_daily_card",
+                    use_container_width=True
+                )
+                if st.button("🔄 最新データ再読込", key="daily_reload_btn", use_container_width=True):
+                    st.cache_data.clear()
+                    st.rerun()
     else:
         st.warning(f"各モールデイリー資料の取得エラー: {d_err}")
