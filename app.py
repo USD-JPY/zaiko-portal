@@ -1,6 +1,8 @@
 import os
 import sys
+import io
 import datetime
+import requests
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -42,6 +44,24 @@ PRINT_LIMITS = {
     "商品別販売実績表": 355,
     "商品別販売実績表_2minutes": 557
 }
+
+# Google ドライブから最新Excelを自動取得する関数
+@st.cache_data(ttl=300)  # 5分間キャッシュ（頻繁な再取得を防ぐ）
+def fetch_excel_from_gdrive(file_id):
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    session = requests.Session()
+    response = session.get(url, allow_redirects=True)
+    
+    # 大容量ファイル警告のトークン処理
+    for key, val in response.cookies.items():
+        if key.startswith("download_warning"):
+            url = f"{url}&confirm={val}"
+            response = session.get(url, allow_redirects=True)
+            break
+            
+    if response.status_code == 200:
+        return io.BytesIO(response.content), None
+    return None, f"取得エラー（ステータスコード: {response.status_code}）"
 
 # 表示列の定義
 def extract_target_columns(df):
@@ -261,16 +281,46 @@ def render_sortable_table_component(df, height=720):
 # ==========================================
 st.subheader("📑 在庫管理表ビューア")
 
-# クラウド用ファイルアップローダー
-uploaded_file = st.file_uploader("📂 最新の軽量版Excelファイルをここにドラッグ＆ドロップ", type=["xlsx"])
+# データソースの自動取得判定
+target_source = None
+data_info_text = ""
 
-target_source = uploaded_file if uploaded_file else "sample_data.xlsx"
+# 1. Google ドライブ連携の確認
+gdrive_id = st.secrets.get("GDRIVE_FILE_ID")
+if gdrive_id:
+    with st.spinner("Google ドライブから最新データを取得中..."):
+        gdrive_bytes, g_err = fetch_excel_from_gdrive(gdrive_id)
+        if gdrive_bytes:
+            target_source = gdrive_bytes
+            data_info_text = "☁️ Google ドライブから自動取得中"
+        else:
+            st.warning(f"Google ドライブ連携エラー: {g_err}")
 
-sheet_choice = st.radio("表示シート", ["商品別販売実績表", "商品別販売実績表_2minutes"], horizontal=True)
+# 2. 手動アップロード（予備・緊急用）
+with st.expander("📂 手動で別ファイルをアップロードする場合（予備）"):
+    uploaded_file = st.file_uploader("最新Excelをドラッグ＆ドロップ", type=["xlsx"])
+    if uploaded_file:
+        target_source = uploaded_file
+        data_info_text = f"📎 アップロード中: `{uploaded_file.name}`"
 
-has_sample = os.path.exists("sample_data.xlsx")
+# 3. リポジトリ内の初期サンプル
+if not target_source and os.path.exists("sample_data.xlsx"):
+    target_source = "sample_data.xlsx"
+    data_info_text = "📁 サンプルデータを表示中"
 
-if uploaded_file or has_sample:
+# 上部操作バー
+c_sheet, c_reload = st.columns([3, 1])
+with c_sheet:
+    sheet_choice = st.radio("表示シート", ["商品別販売実績表", "商品別販売実績表_2minutes"], horizontal=True)
+with c_reload:
+    if st.button("🔄 最新データ再読込", key="reload_cloud"):
+        st.cache_data.clear()
+        st.rerun()
+
+if data_info_text:
+    st.caption(data_info_text)
+
+if target_source:
     df_data, err = load_and_clean_data(target_source, sheet_choice)
     if err:
         st.error(f"データの読み込みに失敗しました: {err}")
@@ -302,4 +352,4 @@ if uploaded_file or has_sample:
         st.caption(f"表示件数: **{len(filtered_df):,}** 行 / 全 **{len(df_data):,}** 行（印刷範囲内）  ※ヘッダー項目クリックでも並び替わります。")
         render_sortable_table_component(filtered_df, height=720)
 else:
-    st.info("👆 上の枠に最新の軽量版Excel（`在庫管理表（xxxx）_軽量版.xlsx`）をアップロードしてください。")
+    st.info("データが設定されていません。SecretsでGDRIVE_FILE_IDを指定するか、ファイルをアップロードしてください。")
