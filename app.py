@@ -4,7 +4,7 @@ import io
 import datetime
 import requests
 import openpyxl
-from openpyxl.utils.cell import range_boundaries, get_column_letter
+from openpyxl.utils.cell import get_column_letter
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -266,7 +266,7 @@ def render_sortable_table_component(df, height=720):
     components.html(html_content, height=height, scrolling=False)
 
 # ==========================================
-# タブ2・タブ3用：Excel完全再現HTMLレンダラー
+# タブ2・タブ3用：Excel帳票高度HTMLレンダラー
 # ==========================================
 def get_excel_sheets(raw_bytes):
     try:
@@ -278,19 +278,46 @@ def get_excel_sheets(raw_bytes):
 def format_excel_cell_value(val, num_format):
     if val is None or val == "":
         return ""
+    
+    fmt = str(num_format).lower()
+
+    # 1. 曜日書式（aaa）の変換（シリアル値または日付から「月〜日」を算出）
+    if "aaa" in fmt:
+        try:
+            if isinstance(val, (int, float)):
+                base_date = datetime.date(1899, 12, 30)
+                d = base_date + datetime.timedelta(days=int(val))
+                weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+                return weekdays[d.weekday()]
+            elif isinstance(val, (datetime.datetime, datetime.date)):
+                weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+                return weekdays[val.weekday()]
+        except Exception:
+            pass
+
+    # 2. 日付型
     if isinstance(val, (datetime.datetime, datetime.date)):
         return val.strftime("%Y/%m/%d")
+
+    # 3. 数値型
     if isinstance(val, (int, float)):
-        fmt = str(num_format).lower()
+        # パーセント表示（%を含むか、小数点以下の微小値で比率の列）
         if "%" in fmt or "0.0%" in fmt:
-            return f"{val * 100:.1f}%" if abs(val) < 10 else f"{val:.1f}%"
+            return f"{val * 100:.1f}%" if abs(val) < 15 else f"{val:.1f}%"
+        # 金額・カンマ区切り
         if "#,##" in fmt or "¥" in fmt or "currency" in fmt:
             return f"{val:,.0f}" if float(val).is_integer() else f"{val:,.2f}"
         if abs(val) >= 1000 and float(val).is_integer():
             return f"{int(val):,}"
+        # 小数点2桁前後の比率や転換率で%書式が漏れている場合
+        if 0 < abs(val) < 1 and ("rate" in fmt or "0.0" in fmt):
+            return f"{val * 100:.1f}%"
+        if isinstance(val, float):
+            return f"{val:.2f}".rstrip('0').rstrip('.')
+
     return str(val)
 
-def render_excel_sheet_as_html(raw_bytes, sheet_name, max_rows=60, max_cols=30, height=720):
+def render_excel_sheet_as_html(raw_bytes, sheet_name, max_rows=65, max_cols=30, height=720):
     try:
         wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
         if sheet_name not in wb.sheetnames:
@@ -313,13 +340,19 @@ def render_excel_sheet_as_html(raw_bytes, sheet_name, max_rows=60, max_cols=30, 
         actual_max_row = min(ws.max_row, max_rows)
         actual_max_col = min(ws.max_column, max_cols)
 
-        # 列幅の取得
+        # 列幅の最適化
         col_widths = {}
         for c in range(1, actual_max_col + 1):
             c_letter = get_column_letter(c)
             dim = ws.column_dimensions.get(c_letter)
-            w = dim.width if dim and dim.width else 10
-            col_widths[c] = int(max(w * 8.5, 45))
+            w = dim.width if dim and dim.width else None
+            # 曜日列（B, C）は細め、それ以外は標準〜広め
+            if c in [2, 3]:
+                col_widths[c] = 40
+            elif w:
+                col_widths[c] = int(max(w * 8.2, 50))
+            else:
+                col_widths[c] = 75
 
         html = f"""
         <!DOCTYPE html>
@@ -330,11 +363,8 @@ def render_excel_sheet_as_html(raw_bytes, sheet_name, max_rows=60, max_cols=30, 
             body {{ margin: 0; padding: 0; font-family: "Meiryo", "Yu Gothic", sans-serif; background-color: #ffffff; }}
             .sheet-container {{ width: 100%; height: {height - 20}px; overflow: auto; border: 1px solid #7f7f7f; }}
             table.sheet-table {{ border-collapse: collapse; font-size: 11px; color: #000000; table-layout: fixed; }}
-            table.sheet-table td {{ border: 1px solid #d4d4d4; padding: 2px 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-            .bold {{ font-weight: bold; }}
-            .center {{ text-align: center; }}
-            .right {{ text-align: right; }}
-            .left {{ text-align: left; }}
+            table.sheet-table td {{ border: 1px solid #c0c0c0; padding: 3px 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+            .row-header td {{ background-color: #f2f2f2; font-weight: bold; text-align: center; }}
         </style>
         </head>
         <body>
@@ -343,11 +373,12 @@ def render_excel_sheet_as_html(raw_bytes, sheet_name, max_rows=60, max_cols=30, 
                 <colgroup>
         """
         for c in range(1, actual_max_col + 1):
-            html += f'<col style="width: {col_widths.get(c, 70)}px;">'
+            html += f'<col style="width: {col_widths.get(c, 75)}px;">'
         html += "</colgroup><tbody>"
 
         for r in range(1, actual_max_row + 1):
-            html += "<tr>"
+            row_tr_class = ' class="row-header"' if r in [4, 5] else ''
+            html += f"<tr{row_tr_class}>"
             for c in range(1, actual_max_col + 1):
                 if (r, c) in skip_cells:
                     continue
@@ -355,17 +386,17 @@ def render_excel_sheet_as_html(raw_bytes, sheet_name, max_rows=60, max_cols=30, 
                 cell = ws.cell(row=r, column=c)
                 val_formatted = format_excel_cell_value(cell.value, cell.number_format)
 
-                # アライメント判定
-                align_cls = "left"
-                if isinstance(cell.value, (int, float)):
-                    align_cls = "right"
-                elif isinstance(cell.value, (datetime.datetime, datetime.date)) or cell.alignment.horizontal == 'center':
-                    align_cls = "center"
+                # 配置判定
+                align = "left"
+                if c in [1, 2, 3] or "aaa" in str(cell.number_format).lower() or isinstance(cell.value, (datetime.datetime, datetime.date)):
+                    align = "center"
+                elif isinstance(cell.value, (int, float)):
+                    align = "right"
 
-                styles = [f"text-align: {align_cls};"]
+                styles = [f"text-align: {align};"]
                 if cell.font and cell.font.bold:
                     styles.append("font-weight: bold;")
-                if cell.font and cell.font.size and cell.font.size >= 14:
+                if cell.font and cell.font.size and cell.font.size >= 12:
                     styles.append(f"font-size: {int(cell.font.size)}px;")
 
                 # 背景色
@@ -471,7 +502,6 @@ with tab_meeting:
 
     if meeting_bytes:
         sheet_list = get_excel_sheets(meeting_bytes)
-        # デフォルトで当月（例: 2026.10）シート、なければ先頭
         default_m_idx = 0
         for idx, s in enumerate(sheet_list):
             if "." in s and s[:4].isdigit():
@@ -496,7 +526,7 @@ with tab_meeting:
             )
 
         st.caption("☁️ Google ドライブから自動取得中（レイアウト・結合セル・書式を完全再現）")
-        html_sheet = render_excel_sheet_as_html(meeting_bytes, selected_sheet, max_rows=70, max_cols=30, height=720)
+        html_sheet = render_excel_sheet_as_html(meeting_bytes, selected_sheet, max_rows=65, max_cols=25, height=720)
         components.html(html_sheet, height=720, scrolling=False)
     else:
         st.warning(f"営業会議資料の取得エラー: {m_err}")
@@ -531,7 +561,7 @@ with tab_daily:
             )
 
         st.caption("☁️ Google ドライブから自動取得中（レイアウト・結合セル・書式を完全再現）")
-        html_daily = render_excel_sheet_as_html(daily_bytes, selected_daily_sheet, max_rows=50, max_cols=35, height=720)
+        html_daily = render_excel_sheet_as_html(daily_bytes, selected_daily_sheet, max_rows=40, max_cols=30, height=720)
         components.html(html_daily, height=720, scrolling=False)
     else:
         st.warning(f"各モールデイリー資料の取得エラー: {d_err}")
